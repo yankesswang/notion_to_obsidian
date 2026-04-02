@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-NOTION_VERSION = "2026-03-11"
+NOTION_VERSION = "2022-06-28"
 BASE_URL = "https://api.notion.com/v1"
 
 
@@ -52,6 +52,91 @@ def notion_get(api_key: str, path: str, params: Optional[Dict[str, Any]] = None)
     resp = requests.get(f"{BASE_URL}{path}", headers=headers, params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+def notion_post(api_key: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    resp = requests.post(f"{BASE_URL}{path}", headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def detect_object_type(api_key: str, object_id: str) -> str:
+    """Returns 'database' or 'page'."""
+    try:
+        notion_get(api_key, f"/databases/{object_id}")
+        return "database"
+    except requests.exceptions.HTTPError:
+        return "page"
+
+
+def query_database(api_key: str, database_id: str) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    while True:
+        payload: Dict[str, Any] = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        data = notion_post(api_key, f"/databases/{database_id}/query", payload)
+        results.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return results
+
+
+def page_title(properties: Dict[str, Any]) -> str:
+    for prop in properties.values():
+        if prop.get("type") == "title":
+            return "".join(r.get("plain_text", "") for r in prop.get("title", []))
+    return ""
+
+
+def properties_to_frontmatter(properties: Dict[str, Any]) -> str:
+    lines = ["---"]
+    for name, prop in properties.items():
+        ptype = prop.get("type", "")
+        value: Any = None
+        if ptype == "title":
+            value = "".join(r.get("plain_text", "") for r in prop.get("title", []))
+        elif ptype == "rich_text":
+            value = "".join(r.get("plain_text", "") for r in prop.get("rich_text", []))
+        elif ptype == "number":
+            value = prop.get("number")
+        elif ptype == "select":
+            sel = prop.get("select")
+            value = sel.get("name") if sel else None
+        elif ptype == "multi_select":
+            value = [s.get("name") for s in prop.get("multi_select", [])]
+        elif ptype == "status":
+            st = prop.get("status")
+            value = st.get("name") if st else None
+        elif ptype == "date":
+            d = prop.get("date")
+            value = d.get("start") if d else None
+        elif ptype == "checkbox":
+            value = prop.get("checkbox")
+        elif ptype == "url":
+            value = prop.get("url")
+        elif ptype == "email":
+            value = prop.get("email")
+        elif ptype == "phone_number":
+            value = prop.get("phone_number")
+        if value is None:
+            continue
+        safe_name = re.sub(r'[":\[\]{}|>&*!]', "", name).strip()
+        if isinstance(value, list):
+            lines.append(f"{safe_name}: [{', '.join(str(v) for v in value)}]")
+        elif isinstance(value, bool):
+            lines.append(f"{safe_name}: {str(value).lower()}")
+        else:
+            lines.append(f'{safe_name}: "{value}"')
+    lines.append("---")
+    return "\n".join(lines)
 
 
 def get_all_children(api_key: str, block_id: str) -> List[Dict[str, Any]]:
@@ -325,6 +410,32 @@ def main() -> None:
     print(f"Destination : {dest_label}")
     print()
 
+    obj_type = detect_object_type(api_key, page_id)
+
+    if obj_type == "database":
+        print("Detected: Notion Database")
+        try:
+            pages = query_database(api_key, page_id)
+        except requests.exceptions.HTTPError as e:
+            print(f"Error querying database: {e}")
+            sys.exit(1)
+        print(f"Found {len(pages)} pages.\n")
+        for i, page in enumerate(pages, start=1):
+            props = page.get("properties", {})
+            title = page_title(props) or page["id"]
+            print(f"  [{i:02d}] {title}")
+            frontmatter = properties_to_frontmatter(props)
+            blocks = fetch_block_tree(api_key, page["id"])
+            md_body = blocks_to_md(blocks, images_dir)
+            md = f"{frontmatter}\n\n# {title}\n\n{md_body}\n"
+            filename = f"{i:02d}_{slugify(title)}.md"
+            filepath = out_dir / filename
+            filepath.write_text(md, encoding="utf-8")
+            print(f"       → {filepath}")
+        print(f"\nDone. {len(pages)} files written to {out_dir}/")
+        return
+
+    # Regular page
     try:
         top_blocks = get_all_children(api_key, page_id)
     except requests.exceptions.HTTPError as e:
